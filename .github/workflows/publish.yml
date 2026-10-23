@@ -1,0 +1,111 @@
+name: Publish Remote
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**.md"
+  schedule:
+    - cron: '0 10 * * 3' # Weekly rebuild to pick up runtime/base updates
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a publish mid-flight, a half-updated repo is worse than a queued one
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  REMOTE_NAME: bog
+  PAGES_URL: https://chrislowles.github.io/bog-flatpak
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
+      options: --privileged
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Import signing key
+        id: gpg
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          KEYID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $5; exit}')
+          echo "keyid=$KEYID" >> "$GITHUB_OUTPUT"
+
+      # Restore what's already published so older apps/commits aren't lost.
+      # First run (nothing published yet) just falls through to an empty repo.
+      - name: Restore existing repo
+        run: |
+          ostree init --mode=archive-z2 --repo=repo
+          ostree remote add --repo=repo --no-gpg-verify live "$PAGES_URL/repo"
+          ostree pull --repo=repo --mirror live \
+            || echo "No existing repo found, starting fresh."
+          ostree remote delete --repo=repo live
+
+      # Builds every manifest in apps/ (none yet, so this is a no-op for now)
+      - name: Build apps
+        run: |
+          flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          shopt -s nullglob
+          for manifest in apps/*.yml apps/*.yaml apps/*.json; do
+            echo "::group::Building $manifest"
+            flatpak-builder --force-clean --disable-rofiles-fuse \
+              --install-deps-from=flathub \
+              --repo=repo --gpg-sign="${{ steps.gpg.outputs.keyid }}" \
+              build-dir "$manifest"
+            echo "::endgroup::"
+          done
+
+      - name: Update repo metadata
+        run: |
+          flatpak build-update-repo \
+            --gpg-sign="${{ steps.gpg.outputs.keyid }}" \
+            --title="$REMOTE_NAME" \
+            --homepage="https://github.com/${{ github.repository }}" \
+            --generate-static-deltas \
+            --prune --prune-depth=3 \
+            repo
+
+      - name: Assemble site
+        run: |
+          mkdir -p site
+          mv repo site/repo
+          KEY=$(gpg --export "${{ steps.gpg.outputs.keyid }}" | base64 -w0)
+          cat > "site/$REMOTE_NAME.flatpakrepo" <<EOF
+          [Flatpak Repo]
+          Title=$REMOTE_NAME
+          Url=$PAGES_URL/repo/
+          Homepage=https://github.com/${{ github.repository }}
+          GPGKey=$KEY
+          EOF
+          # heredoc above is indented by the YAML block; strip leading whitespace
+          sed -i 's/^[[:space:]]*//' "site/$REMOTE_NAME.flatpakrepo"
+          echo "<!doctype html><title>$REMOTE_NAME</title><p>Add with: <code>flatpak remote-add --user $REMOTE_NAME $PAGES_URL/$REMOTE_NAME.flatpakrepo</code>" > site/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
